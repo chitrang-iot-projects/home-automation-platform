@@ -37,3 +37,6 @@ Thumbs.db
 
 # Vercel
 .vercel/
+
+# Local secrets (never commit)
+.secrets/
