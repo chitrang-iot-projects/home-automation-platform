@@ -65,7 +65,13 @@ Working framework firmware `sketch_july04` (11 modules: EventBus, Logger, Schedu
 - **Admin Portal (deployed)**: role-gated (admin/superadmin via /api/me); tabs Houses (CRUD, members, rooms, devices list), Customers (table, search, add/edit, active toggle, 409 handling), Devices (register/edit/delete, room reassign, relay-count, diagnostics row, channel editing); **/setup Board Setup page** — Web Serial (Chrome) writes `{"cmd":"setconfig",...}` JSON line to ESP32 over USB at 115200, credentials never touch the API.
 - All five frontend routes verified 200 in production.
 
+### 2026-07-11 — MQTT layer live (commits 7adddf8, e93d26f)
+- **EMQX Cloud Serverless broker** `home-automation-broker` (project `home-automation-platform`, deployment `lb1d1698`): host `lb1d1698.ala.asia-southeast1.emqxsl.com`, MQTT/TLS 8883, WSS 8084, Asia-Pacific (Singapore, Google Cloud). **Spend limit $0** — free quota only (1M session-minutes, 1 GB traffic/month), suspends instead of billing.
+- Broker credentials: `api-server` (Render env) and `device-b805` (for the B805 board). Both passwords in local gitignored `.secrets/mqtt-credentials.txt` — never committed, never in chat.
+- **API MQTT bridge deployed + verified connected** (EMQX shows 1 active session): MQTTnet hosted service subscribes `ha/+/relay/+` and `ha/+/status`, mirrors reported relay state + telemetry (online/fw/rssi/heap/boot_count) into Postgres; toggle endpoint publishes `ha/<hw>/relay/<n>/set` QoS1. Render env: MQTT_HOST/PORT/USERNAME/PASSWORD.
+- Contract for firmware: [MQTT_CONTRACT.md](MQTT_CONTRACT.md) — topics, retained flags, LWT `{"online":false}`, pendingPush rule, QoS1.
+
 **Open items (blocked on Chitrang):**
-1. EMQX Cloud account signup (https://accounts.emqx.com/signup) → then MQTT layer: broker config, JWT auth endpoint, browser client, API publish on toggle, firmware MqttManager contract.
-2. Promote real admin account: sign up in customer PWA with your email, then run in Neon SQL editor: `UPDATE users SET role='admin' WHERE email='<your email>';`
-3. Firmware side of Board Setup: serial listener for the `setconfig` JSON line (NVS store + reboot).
+1. Promote real admin account: sign up in customer PWA with your email, then Neon SQL: `UPDATE users SET role='admin' WHERE email='<your email>';`
+2. Firmware: (a) serial `setconfig` listener for Board Setup page (NVS store + reboot), (b) `MqttManager` module replacing FirebaseManager per MQTT_CONTRACT.md, using the `device-b805` credential.
+3. Local LAN fast-path: roadmap item — firmware local WebSocket + app fallback logic (after MQTT firmware works).
