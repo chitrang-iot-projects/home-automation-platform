@@ -25,3 +25,26 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
 
   return response.json() as Promise<T>;
 }
+
+/** GET helper. */
+export function apiGet<T>(path: string): Promise<T> {
+  return apiFetch<T>(path);
+}
+
+/** PATCH helper with a JSON body. */
+export function apiPatch<T>(path: string, body: unknown): Promise<T> {
+  return apiFetch<T>(path, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+/** POST helper with a JSON body. */
+export function apiPost<T>(path: string, body: unknown): Promise<T> {
+  return apiFetch<T>(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
