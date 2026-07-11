@@ -15,6 +15,10 @@ if (!string.IsNullOrWhiteSpace(databaseUrl))
 {
     builder.Services.AddSingleton(NpgsqlDataSource.Create(NormalizePostgresConnectionString(databaseUrl)));
     builder.Services.AddScoped<CurrentUserService>();
+
+    // MQTT bridge (no-op when MQTT_* env vars absent) — see ai-documents/MQTT_CONTRACT.md.
+    builder.Services.AddSingleton<MqttService>();
+    builder.Services.AddHostedService(sp => sp.GetRequiredService<MqttService>());
 }
 
 // Firebase Authentication: validate Google-signed ID tokens (JWT bearer).

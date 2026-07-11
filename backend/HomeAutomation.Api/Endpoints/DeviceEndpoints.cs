@@ -190,9 +190,9 @@ public static class DeviceEndpoints
             if (user is null) return Results.Unauthorized();
 
             await using var conn = await db.OpenConnectionAsync();
-            var target = await conn.QuerySingleOrDefaultAsync<(Guid DeviceId, Guid HomeId, int ChannelNo)>(
+            var target = await conn.QuerySingleOrDefaultAsync<(Guid DeviceId, Guid HomeId, int ChannelNo, string HardwareId)>(
                 """
-                SELECT d.id AS DeviceId, d.home_id AS HomeId, c.channel_no AS ChannelNo
+                SELECT d.id AS DeviceId, d.home_id AS HomeId, c.channel_no AS ChannelNo, d.hardware_id AS HardwareId
                 FROM device_channels c JOIN devices d ON d.id = c.device_id
                 WHERE c.id = @channelId
                 """, new { channelId });
@@ -213,7 +213,13 @@ public static class DeviceEndpoints
                         jsonb_build_object('channel', @channelNo, 'on', @on))
                 """, new { deviceId = target.DeviceId, userId = user.Id, channelNo = target.ChannelNo, on = payload.On });
 
-            // MQTT publish slots in here (task: MQTT layer).
+            // Push the command to the board (no-op when MQTT is not configured).
+            var mqtt = ctx.RequestServices.GetService<MqttService>();
+            if (mqtt is not null && mqtt.IsEnabled)
+            {
+                await mqtt.PublishRelayCommandAsync(target.HardwareId, target.ChannelNo, payload.On);
+            }
+
             return Results.Ok(new { channelId, on = payload.On });
         }).RequireAuthorization();
 
