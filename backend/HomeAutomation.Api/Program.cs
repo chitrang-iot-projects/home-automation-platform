@@ -1,4 +1,6 @@
-using System.Security.Claims;
+using System.Threading.RateLimiting;
+using HomeAutomation.Api.Endpoints;
+using HomeAutomation.Api.Infrastructure;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Npgsql;
 
@@ -12,10 +14,10 @@ var databaseUrl = Environment.GetEnvironmentVariable("DATABASE_URL");
 if (!string.IsNullOrWhiteSpace(databaseUrl))
 {
     builder.Services.AddSingleton(NpgsqlDataSource.Create(NormalizePostgresConnectionString(databaseUrl)));
+    builder.Services.AddScoped<CurrentUserService>();
 }
 
 // Firebase Authentication: validate Google-signed ID tokens (JWT bearer).
-// No Firebase Admin SDK needed for verification — standard OIDC discovery.
 var firebaseProjectId = builder.Configuration["Firebase:ProjectId"]
     ?? throw new InvalidOperationException("Firebase:ProjectId is not configured");
 
@@ -43,9 +45,25 @@ builder.Services.AddCors(options =>
               .AllowAnyHeader()
               .AllowAnyMethod()));
 
+// Basic abuse protection: 120 requests/min per client IP.
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(ctx =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            _ => new FixedWindowRateLimiterOptions
+            {
+                Window = TimeSpan.FromMinutes(1),
+                PermitLimit = 120,
+                QueueLimit = 0
+            }));
+});
+
 var app = builder.Build();
 
 app.UseCors();
+app.UseRateLimiter();
 app.UseAuthentication();
 app.UseAuthorization();
 
@@ -75,61 +93,13 @@ app.MapGet("/health/db", async (IServiceProvider services, ILogger<Program> logg
     }
 });
 
-// Returns the caller's platform profile, provisioning the row on first call.
-// Requires a valid Firebase ID token (Authorization: Bearer <token>).
-app.MapGet("/api/me", async (ClaimsPrincipal principal, IServiceProvider services, ILogger<Program> logger) =>
+if (!string.IsNullOrWhiteSpace(databaseUrl))
 {
-    var dataSource = services.GetService<NpgsqlDataSource>();
-    if (dataSource is null)
-    {
-        return Results.Problem(title: "database not configured", statusCode: StatusCodes.Status503ServiceUnavailable);
-    }
-
-    // Firebase token: sub = uid (mapped to NameIdentifier), email, name.
-    var firebaseUid = principal.FindFirstValue(ClaimTypes.NameIdentifier) ?? principal.FindFirstValue("sub");
-    var email = principal.FindFirstValue(ClaimTypes.Email) ?? principal.FindFirstValue("email");
-    var displayName = principal.FindFirstValue("name");
-
-    if (string.IsNullOrEmpty(firebaseUid) || string.IsNullOrEmpty(email))
-    {
-        return Results.BadRequest(new { error = "token is missing uid or email claim" });
-    }
-
-    try
-    {
-        await using var command = dataSource.CreateCommand(
-            """
-            INSERT INTO users (firebase_uid, email, display_name)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (firebase_uid) DO UPDATE
-                SET email        = EXCLUDED.email,
-                    display_name = COALESCE(EXCLUDED.display_name, users.display_name)
-            RETURNING id, firebase_uid, email, display_name, role, is_active, created_at
-            """);
-        command.Parameters.AddWithValue(firebaseUid);
-        command.Parameters.AddWithValue(email);
-        command.Parameters.AddWithValue((object?)displayName ?? DBNull.Value);
-
-        await using var reader = await command.ExecuteReaderAsync();
-        await reader.ReadAsync();
-
-        return Results.Ok(new
-        {
-            id = reader.GetGuid(0),
-            firebase_uid = reader.GetString(1),
-            email = reader.GetString(2),
-            display_name = reader.IsDBNull(3) ? null : reader.GetString(3),
-            role = reader.GetString(4),
-            is_active = reader.GetBoolean(5),
-            created_at = reader.GetDateTime(6)
-        });
-    }
-    catch (Exception ex)
-    {
-        logger.LogError(ex, "Failed to load or provision user profile");
-        return Results.Problem(title: "profile lookup failed", statusCode: StatusCodes.Status500InternalServerError);
-    }
-}).RequireAuthorization();
+    UserEndpoints.Map(app);
+    HomeEndpoints.Map(app);
+    RoomEndpoints.Map(app);
+    DeviceEndpoints.Map(app);
+}
 
 app.Run();
 
