@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Dapper;
 using HomeAutomation.Api.Infrastructure;
 using Npgsql;
@@ -82,7 +83,22 @@ public static class UserEndpoints
                 GROUP BY u.id
                 ORDER BY u.created_at DESC
                 """);
-            return Results.Ok(users);
+
+            // json_agg comes back from Dapper as a raw string — parse so the
+            // response carries a real JSON array, not an escaped string.
+            var shaped = users.Select(u => new
+            {
+                u.id,
+                u.email,
+                u.displayname,
+                u.contact,
+                u.role,
+                u.isactive,
+                u.registered,
+                u.createdat,
+                homes = JsonSerializer.Deserialize<JsonElement>((string)u.homes)
+            });
+            return Results.Ok(shaped);
         });
 
         group.MapPost("/", async (HttpContext ctx, AdminUserInput input, CurrentUserService cus, NpgsqlDataSource db) =>

@@ -13,7 +13,18 @@ export default function CustomersTab() {
 
   const load = useCallback(async () => {
     try {
-      setUsers(await apiFetch<AdminUser[]>("/api/users"));
+      const rows = await apiFetch<AdminUser[]>("/api/users");
+      // Defensive: older API builds returned `homes` as a JSON string.
+      setUsers(
+        rows.map((u) => ({
+          ...u,
+          homes: Array.isArray(u.homes)
+            ? u.homes
+            : typeof u.homes === "string"
+              ? JSON.parse(u.homes)
+              : [],
+        })),
+      );
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load users");
