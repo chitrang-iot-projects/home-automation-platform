@@ -7,6 +7,7 @@ namespace HomeAutomation.Api.Endpoints;
 public static class DeviceEndpoints
 {
     public record DeviceInput(string? Name, string? HardwareId, Guid? RoomId, int? RelayCount);
+    public record TogglePayload(bool On);
     public record ChannelPatch(
         string? Name, string? Icon, string? ApplianceType,
         bool? IsFavorite, int? SortIndex, bool? BumpUsage);
@@ -156,6 +157,65 @@ public static class DeviceEndpoints
             var rows = await conn.ExecuteAsync("DELETE FROM devices WHERE id = @deviceId", new { deviceId });
             return rows == 0 ? Results.NotFound() : Results.NoContent();
         });
+
+        // ---- channel state ------------------------------------------------------
+        // Postgres holds last-known/desired relay state in devices.state jsonb
+        // ({"relay1": true, ...}). Today the dashboard polls; when the MQTT layer
+        // lands, the toggle endpoint additionally publishes and devices report
+        // actual state back. Contract stays stable for the frontends.
+
+        app.MapGet("/api/homes/{homeId:guid}/state", async (HttpContext ctx, Guid homeId, NpgsqlDataSource db, CurrentUserService cus) =>
+        {
+            var user = await cus.ResolveAsync(ctx.User);
+            if (user is null) return Results.Unauthorized();
+
+            await using var conn = await db.OpenConnectionAsync();
+            if (!await Access.CanAccessHomeAsync(conn, user, homeId)) return Results.Forbid();
+
+            var rows = await conn.QueryAsync<(Guid ChannelId, bool? On)>(
+                """
+                SELECT c.id AS ChannelId,
+                       (d.state ->> ('relay' || c.channel_no))::boolean AS "On"
+                FROM device_channels c
+                JOIN devices d ON d.id = c.device_id
+                WHERE d.home_id = @homeId
+                """, new { homeId });
+
+            return Results.Ok(new { states = rows.ToDictionary(r => r.ChannelId, r => r.On ?? false) });
+        }).RequireAuthorization();
+
+        app.MapPost("/api/channels/{channelId:guid}/toggle", async (HttpContext ctx, Guid channelId, TogglePayload payload, NpgsqlDataSource db, CurrentUserService cus) =>
+        {
+            var user = await cus.ResolveAsync(ctx.User);
+            if (user is null) return Results.Unauthorized();
+
+            await using var conn = await db.OpenConnectionAsync();
+            var target = await conn.QuerySingleOrDefaultAsync<(Guid DeviceId, Guid HomeId, int ChannelNo)>(
+                """
+                SELECT d.id AS DeviceId, d.home_id AS HomeId, c.channel_no AS ChannelNo
+                FROM device_channels c JOIN devices d ON d.id = c.device_id
+                WHERE c.id = @channelId
+                """, new { channelId });
+            if (target == default) return Results.NotFound();
+            if (!await Access.CanAccessHomeAsync(conn, user, target.HomeId)) return Results.Forbid();
+
+            await conn.ExecuteAsync(
+                """
+                UPDATE devices
+                SET state = jsonb_set(state, ARRAY['relay' || @channelNo::text], to_jsonb(@on), true)
+                WHERE id = @deviceId
+                """, new { deviceId = target.DeviceId, channelNo = target.ChannelNo, on = payload.On });
+
+            await conn.ExecuteAsync(
+                """
+                INSERT INTO device_events (device_id, user_id, event_type, payload)
+                VALUES (@deviceId, @userId, 'command',
+                        jsonb_build_object('channel', @channelNo, 'on', @on))
+                """, new { deviceId = target.DeviceId, userId = user.Id, channelNo = target.ChannelNo, on = payload.On });
+
+            // MQTT publish slots in here (task: MQTT layer).
+            return Results.Ok(new { channelId, on = payload.On });
+        }).RequireAuthorization();
 
         // ---- channels ---------------------------------------------------------
 
