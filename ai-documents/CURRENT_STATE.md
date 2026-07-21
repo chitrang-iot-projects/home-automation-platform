@@ -71,7 +71,12 @@ Working framework firmware `sketch_july04` (11 modules: EventBus, Logger, Schedu
 - **API MQTT bridge deployed + verified connected** (EMQX shows 1 active session): MQTTnet hosted service subscribes `ha/+/relay/+` and `ha/+/status`, mirrors reported relay state + telemetry (online/fw/rssi/heap/boot_count) into Postgres; toggle endpoint publishes `ha/<hw>/relay/<n>/set` QoS1. Render env: MQTT_HOST/PORT/USERNAME/PASSWORD.
 - Contract for firmware: [MQTT_CONTRACT.md](MQTT_CONTRACT.md) — topics, retained flags, LWT `{"online":false}`, pendingPush rule, QoS1.
 
+### 2026-07-11 — Firmware MQTT module written
+- Repo `chitrang313/esp32-iot-framework`, branch `phase-one`: added `Cloud/MqttManager/` (MqttManager.h/.cpp/README — PubSubClient + WiFiClientSecure TLS 8883, subscribes `ha/<id>/relay/+/set`, publishes retained relay state + status JSON, LWT, offline queue, backoff reconnect) and `sketch_july21/` (july04 adapted: Firebase + SyncManager dropped, MqttManager owns cloud; same B805 hardware). secrets.h.example prefilled with broker host/port/user + device id; real device password stays in platform `.secrets/`.
+- `chitrang313@gmail.com` promoted to admin (Neon); B805 house created; Customers-tab json_agg crash fixed.
+
 **Open items (blocked on Chitrang):**
-1. Promote real admin account: sign up in customer PWA with your email, then Neon SQL: `UPDATE users SET role='admin' WHERE email='<your email>';`
-2. Firmware: (a) serial `setconfig` listener for Board Setup page (NVS store + reboot), (b) `MqttManager` module replacing FirebaseManager per MQTT_CONTRACT.md, using the `device-b805` credential.
-3. Local LAN fast-path: roadmap item — firmware local WebSocket + app fallback logic (after MQTT firmware works).
+1. Flash firmware: install PubSubClient + ArduinoJson libs; copy `sketch_july21/secrets.h.example` → `secrets.h`; fill WiFi + device MQTT password; flash B805 via Arduino IDE.
+2. Register B805 in admin → Devices (Hardware ID = `PdMHOx6Pg6EIo9tmpMvV`, matching SECRET_DEVICE_ID).
+3. Board Setup page serial `setconfig` listener (optional convenience — firmware side not written yet).
+4. Local LAN fast-path (roadmap).
