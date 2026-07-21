@@ -55,8 +55,9 @@ public static class DeviceEndpoints
             return Results.Ok(result);
         });
 
-        // Register a board (admin). Auto-creates channel rows 1..relay_count.
-        homeGroup.MapPost("/", async (HttpContext ctx, Guid homeId, DeviceInput input, NpgsqlDataSource db, CurrentUserService cus) =>
+        // Register a board (admin). Auto-creates channel rows 1..relay_count and
+        // provisions a unique, topic-scoped MQTT credential in EMQX.
+        homeGroup.MapPost("/", async (HttpContext ctx, Guid homeId, DeviceInput input, NpgsqlDataSource db, CurrentUserService cus, EmqxAdminService emqx) =>
         {
             var user = await cus.ResolveAsync(ctx.User);
             if (user is null) return Results.Unauthorized();
@@ -66,36 +67,55 @@ public static class DeviceEndpoints
 
             var relayCount = input.RelayCount ?? 4;
             if (relayCount is < 1 or > 16) return Results.BadRequest(new { error = "relayCount must be 1..16" });
+            var hardwareId = input.HardwareId.Trim();
 
             await using var conn = await db.OpenConnectionAsync();
             await using var tx = await conn.BeginTransactionAsync();
+            Guid deviceId;
             try
             {
-                var device = await conn.QuerySingleAsync(
+                var row = await conn.QuerySingleAsync(
                     """
                     INSERT INTO devices (home_id, room_id, type_code, name, hardware_id, relay_count)
                     VALUES (@homeId, @roomId, 'controller', @name, @hardwareId, @relayCount)
-                    RETURNING id, home_id AS homeid, room_id AS roomid, name, hardware_id AS hardwareid,
-                              relay_count AS relaycount, is_online AS isonline, created_at AS createdat
+                    RETURNING id
                     """,
-                    new { homeId, roomId = input.RoomId, name = input.Name.Trim(), hardwareId = input.HardwareId.Trim(), relayCount },
+                    new { homeId, roomId = input.RoomId, name = input.Name.Trim(), hardwareId, relayCount },
                     tx);
+                deviceId = (Guid)row.id;
 
                 for (var n = 1; n <= relayCount; n++)
                 {
                     await conn.ExecuteAsync(
                         "INSERT INTO device_channels (device_id, channel_no, name) VALUES (@deviceId, @n, @name)",
-                        new { deviceId = (Guid)device.id, n, name = $"Switch {n}" }, tx);
+                        new { deviceId, n, name = $"Switch {n}" }, tx);
                 }
 
                 await tx.CommitAsync();
-                return Results.Ok(device);
             }
             catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UniqueViolation)
             {
                 await tx.RollbackAsync();
                 return Results.Conflict(new { error = "a device with this hardware id already exists" });
             }
+
+            // Provision the MQTT credential outside the DB transaction (external call).
+            var cred = await emqx.ProvisionAsync(hardwareId);
+            if (cred is not null)
+            {
+                await conn.ExecuteAsync(
+                    "UPDATE devices SET mqtt_username = @u, mqtt_password = @p WHERE id = @id",
+                    new { u = cred.Username, p = cred.Password, id = deviceId });
+            }
+
+            var device = await conn.QuerySingleAsync(
+                """
+                SELECT id, home_id AS homeid, room_id AS roomid, name, hardware_id AS hardwareid,
+                       relay_count AS relaycount, is_online AS isonline,
+                       mqtt_username AS mqttusername, mqtt_password AS mqttpassword, created_at AS createdat
+                FROM devices WHERE id = @deviceId
+                """, new { deviceId });
+            return Results.Ok(device);
         });
 
         var deviceGroup = app.MapGroup("/api/devices/{deviceId:guid}").RequireAuthorization();
@@ -147,15 +167,58 @@ public static class DeviceEndpoints
             return Results.Ok(device);
         });
 
-        deviceGroup.MapDelete("/", async (HttpContext ctx, Guid deviceId, NpgsqlDataSource db, CurrentUserService cus) =>
+        deviceGroup.MapDelete("/", async (HttpContext ctx, Guid deviceId, NpgsqlDataSource db, CurrentUserService cus, EmqxAdminService emqx) =>
         {
             var user = await cus.ResolveAsync(ctx.User);
             if (user is null) return Results.Unauthorized();
             if (!user.IsAdmin) return Results.Forbid();
 
             await using var conn = await db.OpenConnectionAsync();
-            var rows = await conn.ExecuteAsync("DELETE FROM devices WHERE id = @deviceId", new { deviceId });
-            return rows == 0 ? Results.NotFound() : Results.NoContent();
+            var hardwareId = await conn.ExecuteScalarAsync<string?>(
+                "SELECT hardware_id FROM devices WHERE id = @deviceId", new { deviceId });
+            if (hardwareId is null) return Results.NotFound();
+
+            await conn.ExecuteAsync("DELETE FROM devices WHERE id = @deviceId", new { deviceId });
+            await emqx.DeleteAsync(hardwareId);   // revoke the broker credential
+            return Results.NoContent();
+        });
+
+        // Fetch a board's MQTT credential (admin only) — for flashing / Board Setup.
+        deviceGroup.MapGet("/credentials", async (HttpContext ctx, Guid deviceId, NpgsqlDataSource db, CurrentUserService cus) =>
+        {
+            var user = await cus.ResolveAsync(ctx.User);
+            if (user is null) return Results.Unauthorized();
+            if (!user.IsAdmin) return Results.Forbid();
+
+            await using var conn = await db.OpenConnectionAsync();
+            var cred = await conn.QuerySingleOrDefaultAsync(
+                """
+                SELECT hardware_id AS hardwareid, mqtt_username AS mqttusername, mqtt_password AS mqttpassword
+                FROM devices WHERE id = @deviceId
+                """, new { deviceId });
+            return cred is null ? Results.NotFound() : Results.Ok(cred);
+        });
+
+        // Rotate a board's MQTT credential (admin only). Old password stops working.
+        deviceGroup.MapPost("/credentials/rotate", async (HttpContext ctx, Guid deviceId, NpgsqlDataSource db, CurrentUserService cus, EmqxAdminService emqx) =>
+        {
+            var user = await cus.ResolveAsync(ctx.User);
+            if (user is null) return Results.Unauthorized();
+            if (!user.IsAdmin) return Results.Forbid();
+            if (!emqx.IsEnabled) return Results.Problem(title: "MQTT provisioning not configured", statusCode: StatusCodes.Status503ServiceUnavailable);
+
+            await using var conn = await db.OpenConnectionAsync();
+            var hardwareId = await conn.ExecuteScalarAsync<string?>(
+                "SELECT hardware_id FROM devices WHERE id = @deviceId", new { deviceId });
+            if (hardwareId is null) return Results.NotFound();
+
+            var cred = await emqx.ProvisionAsync(hardwareId);
+            if (cred is null) return Results.Problem(title: "provisioning failed", statusCode: StatusCodes.Status502BadGateway);
+
+            await conn.ExecuteAsync(
+                "UPDATE devices SET mqtt_username = @u, mqtt_password = @p WHERE id = @deviceId",
+                new { u = cred.Username, p = cred.Password, deviceId });
+            return Results.Ok(new { hardwareid = hardwareId, mqttusername = cred.Username, mqttpassword = cred.Password });
         });
 
         // ---- channel state ------------------------------------------------------

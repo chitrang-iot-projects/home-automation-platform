@@ -19,6 +19,11 @@ if (!string.IsNullOrWhiteSpace(databaseUrl))
     // MQTT bridge (no-op when MQTT_* env vars absent) — see ai-documents/MQTT_CONTRACT.md.
     builder.Services.AddSingleton<MqttService>();
     builder.Services.AddHostedService(sp => sp.GetRequiredService<MqttService>());
+
+    // Per-device MQTT credential provisioning via EMQX REST API (no-op when
+    // EMQX_API_* env vars absent).
+    builder.Services.AddHttpClient();
+    builder.Services.AddScoped<EmqxAdminService>();
 }
 
 // Firebase Authentication: validate Google-signed ID tokens (JWT bearer).
