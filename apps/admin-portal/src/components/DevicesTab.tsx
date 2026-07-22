@@ -121,6 +121,81 @@ export default function DevicesTab({
   );
 }
 
+// Broker host for the flash snippet (public, non-secret).
+const MQTT_HOST = "lb1d1698.ala.asia-southeast1.emqxsl.com";
+
+interface DeviceCredentials {
+  hardwareid: string;
+  mqttusername: string | null;
+  mqttpassword: string | null;
+}
+
+/** Reveal-on-demand panel showing the values needed to flash this board. */
+function FlashCredentials({ deviceId }: { deviceId: string }) {
+  const [cred, setCred] = useState<DeviceCredentials | null>(null);
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function reveal() {
+    if (cred) {
+      setOpen((o) => !o);
+      return;
+    }
+    setBusy(true);
+    setErr(null);
+    try {
+      setCred(await apiFetch<DeviceCredentials>(`/api/devices/${deviceId}/credentials`));
+      setOpen(true);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Failed to load credentials");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const snippet =
+    cred && cred.mqttusername
+      ? `#define SECRET_DEVICE_ID   "${cred.hardwareid}"\n` +
+        `#define SECRET_MQTT_HOST   "${MQTT_HOST}"\n` +
+        `#define SECRET_MQTT_PORT   8883\n` +
+        `#define SECRET_MQTT_USER   "${cred.mqttusername}"\n` +
+        `#define SECRET_MQTT_PASS   "${cred.mqttpassword ?? ""}"`
+      : null;
+
+  return (
+    <div className="mt-3">
+      <button
+        onClick={reveal}
+        disabled={busy}
+        className="rounded-lg border border-gray-300 px-3 py-1 text-xs font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+      >
+        {busy ? "Loading…" : open ? "Hide flash credentials" : "Show flash credentials"}
+      </button>
+      {err && <p className="mt-1 text-xs text-red-600">{err}</p>}
+      {open && cred && (
+        <div className="mt-2 rounded-lg bg-gray-900 p-3">
+          {snippet ? (
+            <>
+              <p className="mb-2 text-xs text-gray-400">
+                Paste into <code>sketch_july21/secrets.h</code> (plus your WiFi), then flash:
+              </p>
+              <pre className="overflow-x-auto whitespace-pre-wrap break-all font-mono text-xs text-green-300">
+                {snippet}
+              </pre>
+            </>
+          ) : (
+            <p className="text-xs text-amber-300">
+              No MQTT credential on this device (provisioning was disabled at
+              registration). Delete and re-register, or rotate credentials.
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function DeviceCard({
   device,
   home,
@@ -270,6 +345,9 @@ function DeviceCard({
           </strong>
         </span>
       </div>
+
+      {/* Flash credentials */}
+      <FlashCredentials deviceId={device.id} />
 
       {/* Channels */}
       <div className="mt-3">
@@ -469,15 +547,18 @@ function RegisterDeviceModal({
           </div>
           <div>
             <label className="mb-1 block text-xs font-medium text-gray-500">
-              Hardware ID *
+              Hardware ID
             </label>
             <input
-              required
               value={hardwareId}
               onChange={(e) => setHardwareId(e.target.value)}
-              placeholder="e.g. ESP32-AABBCCDDEEFF"
+              placeholder="leave blank to auto-generate"
               className="w-full rounded-lg border border-gray-300 px-3 py-2 font-mono text-sm focus:border-blue-500 focus:outline-none"
             />
+            <p className="mt-1 text-xs text-gray-400">
+              The board&apos;s id (used in its MQTT topics + flashed into firmware).
+              Leave blank and the platform assigns one.
+            </p>
           </div>
           <div>
             <label className="mb-1 block text-xs font-medium text-gray-500">

@@ -63,11 +63,16 @@ public static class DeviceEndpoints
             if (user is null) return Results.Unauthorized();
             if (!user.IsAdmin) return Results.Forbid();
             if (string.IsNullOrWhiteSpace(input.Name)) return Results.BadRequest(new { error = "name is required" });
-            if (string.IsNullOrWhiteSpace(input.HardwareId)) return Results.BadRequest(new { error = "hardwareId is required" });
 
             var relayCount = input.RelayCount ?? 4;
             if (relayCount is < 1 or > 16) return Results.BadRequest(new { error = "relayCount must be 1..16" });
-            var hardwareId = input.HardwareId.Trim();
+
+            // Hardware ID is the board's assigned identity (used in MQTT topics and
+            // flashed into the firmware). If the admin leaves it blank, the platform
+            // assigns a unique one — no need to read anything off the chip.
+            var hardwareId = string.IsNullOrWhiteSpace(input.HardwareId)
+                ? $"esp32-{Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(6)).ToLowerInvariant()}"
+                : input.HardwareId.Trim();
 
             await using var conn = await db.OpenConnectionAsync();
             await using var tx = await conn.BeginTransactionAsync();
