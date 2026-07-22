@@ -75,8 +75,15 @@ Working framework firmware `sketch_july04` (11 modules: EventBus, Logger, Schedu
 - Repo `chitrang313/esp32-iot-framework`, branch `phase-one`: added `Cloud/MqttManager/` (MqttManager.h/.cpp/README — PubSubClient + WiFiClientSecure TLS 8883, subscribes `ha/<id>/relay/+/set`, publishes retained relay state + status JSON, LWT, offline queue, backoff reconnect) and `sketch_july21/` (july04 adapted: Firebase + SyncManager dropped, MqttManager owns cloud; same B805 hardware). secrets.h.example prefilled with broker host/port/user + device id; real device password stays in platform `.secrets/`.
 - `chitrang313@gmail.com` promoted to admin (Neon); B805 house created; Customers-tab json_agg crash fixed.
 
+### 2026-07-22 — Per-device MQTT credentials live (commit 79e28e4, verified in prod)
+- EMQX REST API key created (`odd29818`); saved in `.secrets/`; set in Render as `EMQX_API_ENDPOINT` / `EMQX_API_APP_ID` / `EMQX_API_APP_SECRET`.
+- `EmqxAdminService` (backend): on device register, generates unique `dev-<hardwareId>` + random password, creates it in EMQX built-in-db auth, adds an authorization rule scoping it to `ha/<hardwareId>/#` only; stores creds in `devices.mqtt_username`/`mqtt_password` (migration 004). Device delete revokes the EMQX user+rule. `GET /api/devices/{id}/credentials` + `POST .../credentials/rotate` (admin only). Disabled gracefully when `EMQX_API_*` absent.
+- **Verified end-to-end in production**: registered a test device → API returned unique username+password → EMQX showed the user + `ha/<hwid>/#` ACL rule → deleted device → EMQX credential revoked. Test user/home cleaned up.
+- No more shared password: every board gets its own revocable, topic-scoped credential.
+- **Known hardening follow-up**: EMQX global authorization default is still "allow"; per-device allow-rules are in place but full isolation needs flipping the broker default to deny (broker-wide change, deferred to avoid disrupting the live B805 board).
+
 **Open items (blocked on Chitrang):**
-1. Flash firmware: install PubSubClient + ArduinoJson libs; copy `sketch_july21/secrets.h.example` → `secrets.h`; fill WiFi + device MQTT password; flash B805 via Arduino IDE.
-2. Register B805 in admin → Devices (Hardware ID = `PdMHOx6Pg6EIo9tmpMvV`, matching SECRET_DEVICE_ID).
-3. Board Setup page serial `setconfig` listener (optional convenience — firmware side not written yet).
+1. Flash firmware: install PubSubClient + ArduinoJson libs; copy `sketch_july21/secrets.h.example` → `secrets.h`; fill WiFi + device MQTT password; flash B805 via Arduino IDE. (B805's cred is the hand-made `device-b805`; to move it onto the per-device scheme, register B805 in admin → Devices to get a `dev-PdMHOx6Pg6EIo9tmpMvV` cred, or keep `device-b805` — both work.)
+2. Board Setup page serial `setconfig` listener (optional convenience — firmware side not written yet); would also let the setup page fetch per-device creds via `GET /api/devices/{id}/credentials`.
+3. Hardening: flip EMQX default authorization to deny (see above).
 4. Local LAN fast-path (roadmap).
