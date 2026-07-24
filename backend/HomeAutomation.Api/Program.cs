@@ -67,6 +67,17 @@ builder.Services.AddRateLimiter(options =>
                 PermitLimit = 120,
                 QueueLimit = 0
             }));
+
+    // Stricter limit for the unauthenticated device provisioning endpoint.
+    options.AddPolicy("provision", ctx =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            _ => new FixedWindowRateLimiterOptions
+            {
+                Window = TimeSpan.FromMinutes(1),
+                PermitLimit = 20,
+                QueueLimit = 0
+            }));
 });
 
 var app = builder.Build();
@@ -108,6 +119,7 @@ if (!string.IsNullOrWhiteSpace(databaseUrl))
     HomeEndpoints.Map(app);
     RoomEndpoints.Map(app);
     DeviceEndpoints.Map(app);
+    ProvisionEndpoints.Map(app);
 }
 
 app.Run();

@@ -171,6 +171,7 @@ export default function DashboardPage() {
   const [reorderMode, setReorderMode] = useState(false);
   const [editing, setEditing] = useState<Channel | null>(null);
   const [filters, setFilters] = useState<FilterState>(EMPTY_FILTERS);
+  const [addingDevice, setAddingDevice] = useState(false);
 
   useEffect(() => {
     return onAuthStateChanged(auth, (u) => {
@@ -349,13 +350,29 @@ export default function DashboardPage() {
           </div>
         ) : homes.length === 0 ? (
           <div className="rounded-xl bg-white p-8 text-center">
-            <p className="text-gray-600">No homes linked to your account yet.</p>
+            <p className="text-gray-600">No devices yet.</p>
             <p className="mt-1 text-sm text-gray-400">
-              Ask your installer or home owner to invite you.
+              Power on your board, connect it to WiFi, then add it here.
             </p>
+            <button
+              onClick={() => setAddingDevice(true)}
+              className="mt-4 min-h-11 rounded-lg bg-blue-600 px-6 py-2 font-medium text-white hover:bg-blue-700"
+            >
+              + Add device
+            </button>
           </div>
         ) : (
           <>
+            {/* Add-device action */}
+            <div className="flex justify-end">
+              <button
+                onClick={() => setAddingDevice(true)}
+                className="min-h-11 rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-100"
+              >
+                + Add device
+              </button>
+            </div>
+
             {/* House chips (only when more than one home) */}
             {homes.length > 1 && (
               <div className="flex gap-2 overflow-x-auto pb-1">
@@ -509,6 +526,84 @@ export default function DashboardPage() {
           onSaved={(updated) => data.updateChannel(updated.id, updated)}
         />
       )}
+
+      {addingDevice && (
+        <AddDeviceModal
+          onClose={() => setAddingDevice(false)}
+          onClaimed={() => {
+            setAddingDevice(false);
+            data.refresh();
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+/** Claim a board that's already online (self-provisioned) into the user's home
+ *  by its Hardware ID — the value printed on the board / its QR sticker. */
+function AddDeviceModal({
+  onClose,
+  onClaimed,
+}: {
+  onClose: () => void;
+  onClaimed: () => void;
+}) {
+  const [hardwareId, setHardwareId] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    setError(null);
+    try {
+      await apiPost("/api/devices/claim", { hardwareId: hardwareId.trim() });
+      onClaimed();
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Could not add device. Check the ID and that it's online.",
+      );
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={onClose}>
+      <div className="w-full max-w-sm rounded-xl bg-white p-6 shadow-lg" onClick={(e) => e.stopPropagation()}>
+        <h2 className="mb-1 text-lg font-semibold">Add device</h2>
+        <p className="mb-4 text-sm text-gray-500">
+          Enter the Hardware ID printed on your board (or its QR sticker). The
+          board must be powered on and connected to WiFi.
+        </p>
+        <form onSubmit={submit} className="space-y-4">
+          <input
+            autoFocus
+            required
+            value={hardwareId}
+            onChange={(e) => setHardwareId(e.target.value)}
+            placeholder="e.g. esp32-a1b2c3d4e5f6"
+            className="w-full rounded-lg border border-gray-300 px-3 py-2 font-mono text-sm focus:border-blue-500 focus:outline-none"
+          />
+          {error && <p className="text-sm text-red-600">{error}</p>}
+          <div className="flex justify-end gap-2">
+            <button
+              type="button"
+              onClick={onClose}
+              className="min-h-11 rounded-lg border border-gray-300 px-4 py-2 text-sm font-medium hover:bg-gray-50"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={busy || !hardwareId.trim()}
+              className="min-h-11 rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
+            >
+              {busy ? "Adding…" : "Add device"}
+            </button>
+          </div>
+        </form>
+      </div>
     </div>
   );
 }
