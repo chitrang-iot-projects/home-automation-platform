@@ -92,8 +92,13 @@ Architecture agreed with Chitrang: **provisioning (WiFi) and claiming (ownership
 - Render env `PROVISION_KEY` set (value in `.secrets/`).
 - **Verified in production** (simulated board via curl): provision 200 + creds → idempotent re-provision → bad key 401 → customer claim attaches to "My Home" → re-claim 409. EMQX cred + test rows cleaned up.
 
+### 2026-07-24 — Provisioning V1 Phase 2: generic firmware (captive portal) — BUILT
+- Firmware repo `chitrang-iot-projects/esp32-iot-framework` branch `phase-one`: added `Config/ConfigStore` (NVS wifi+mqtt), `Provisioning/CaptivePortalManager` (AP `HA-SETUP-<id>` + captive portal at 192.168.4.1, WiFi scan/select), and **`July_24072026/`** generic sketch. ONE binary for all boards — no per-board compile-time values. secrets.h holds only shared `SECRET_PROVISION_KEY` + `SECRET_API_BASE`.
+- Boot: no wifi → setup AP; wifi set → connect → `POST /api/provision` (hardwareId `esp32-<mac>` + key) → store MQTT creds → MQTT online. Factory reset = hold BOOT/GPIO0 5s. Relays/switches work offline (NVS state).
+- **Not compile-tested** (no board/toolchain in session). Flash one unit to verify AP → WiFi → provision → online.
+
 **Open items (blocked on Chitrang):**
-1. **Phase 2 — firmware captive portal** (next build): `ConfigStore` (NVS) + `CaptivePortalManager` (AP `HA-SETUP-<id>`, WiFi scan/select page at 192.168.4.1) + self-provision HTTP call + boot logic + factory reset (BOOT button) + `sketch_july28`. Flash once, then all setup via the board's own WiFi page. Provisioning key baked into firmware.
-2. Existing B805 board: still on hand-made `device-b805` cred (works). Migrate onto per-device scheme when convenient.
+1. Flash `July_24072026` onto a board (fill secrets.h with PROVISION_KEY + API base — both in `.secrets/`), verify the plug-and-play handshake live.
+2. Existing B805 board: still on hand-made `device-b805` cred (works). Reflash with generic firmware to move it onto self-provisioning.
 3. Hardening: flip EMQX default authorization to deny.
-4. Local LAN fast-path (roadmap).
+4. Local LAN fast-path (roadmap); QR label generation at manufacturing.
