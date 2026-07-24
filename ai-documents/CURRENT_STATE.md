@@ -82,8 +82,18 @@ Working framework firmware `sketch_july04` (11 modules: EventBus, Logger, Schedu
 - No more shared password: every board gets its own revocable, topic-scoped credential.
 - **Known hardening follow-up**: EMQX global authorization default is still "allow"; per-device allow-rules are in place but full isolation needs flipping the broker default to deny (broker-wide change, deferred to avoid disrupting the live B805 board).
 
+### 2026-07-24 — Provisioning V1 Phase 1: self-provision + claim (commits through this date, verified in prod)
+Architecture agreed with Chitrang: **provisioning (WiFi) and claiming (ownership) are separate**. Board self-provisions MQTT creds by Hardware ID; customer claims ownership later in the app.
+- Migration 005: `devices.home_id` nullable; added `claimed`, `provisioned_at`, `device_type`.
+- `POST /api/provision` — device-facing, gated by `PROVISION_KEY` header (X-Provision-Key), rate-limited (20/min/IP). Board sends `{hardwareId, firmwareVersion, deviceType, relayCount}` → upserts unclaimed device, auto-provisions MQTT cred, returns `{deviceId, mqttHost, mqttPort, mqttUsername, mqttPassword}`. Idempotent (reboot returns same creds).
+- `POST /api/devices/claim` — customer-authed. `{hardwareId}` → attaches device to caller's home (auto-creates "My Home" if none). Re-claim → 409.
+- Customer PWA: **Add Device** modal (claim by Hardware ID; QR later carries the ID).
+- Hardware ID now auto-generated (`esp32-<hex>`) if blank at admin register; device cards show a copy-paste `secrets.h` snippet via `/api/devices/{id}/credentials`.
+- Render env `PROVISION_KEY` set (value in `.secrets/`).
+- **Verified in production** (simulated board via curl): provision 200 + creds → idempotent re-provision → bad key 401 → customer claim attaches to "My Home" → re-claim 409. EMQX cred + test rows cleaned up.
+
 **Open items (blocked on Chitrang):**
-1. Flash firmware: install PubSubClient + ArduinoJson libs; copy `sketch_july21/secrets.h.example` → `secrets.h`; fill WiFi + device MQTT password; flash B805 via Arduino IDE. (B805's cred is the hand-made `device-b805`; to move it onto the per-device scheme, register B805 in admin → Devices to get a `dev-PdMHOx6Pg6EIo9tmpMvV` cred, or keep `device-b805` — both work.)
-2. Board Setup page serial `setconfig` listener (optional convenience — firmware side not written yet); would also let the setup page fetch per-device creds via `GET /api/devices/{id}/credentials`.
-3. Hardening: flip EMQX default authorization to deny (see above).
+1. **Phase 2 — firmware captive portal** (next build): `ConfigStore` (NVS) + `CaptivePortalManager` (AP `HA-SETUP-<id>`, WiFi scan/select page at 192.168.4.1) + self-provision HTTP call + boot logic + factory reset (BOOT button) + `sketch_july28`. Flash once, then all setup via the board's own WiFi page. Provisioning key baked into firmware.
+2. Existing B805 board: still on hand-made `device-b805` cred (works). Migrate onto per-device scheme when convenient.
+3. Hardening: flip EMQX default authorization to deny.
 4. Local LAN fast-path (roadmap).
