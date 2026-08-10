@@ -72,6 +72,7 @@ export interface Channel {
 
 export interface Device {
   id: string;
+  homeid?: string | null;
   roomid: string | null;
   name: string;
   hardwareid: string;

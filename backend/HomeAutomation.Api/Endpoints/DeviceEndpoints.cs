@@ -6,7 +6,7 @@ namespace HomeAutomation.Api.Endpoints;
 
 public static class DeviceEndpoints
 {
-    public record DeviceInput(string? Name, string? HardwareId, Guid? RoomId, int? RelayCount);
+    public record DeviceInput(string? Name, string? HardwareId, Guid? HomeId, Guid? RoomId, int? RelayCount);
     public record TogglePayload(bool On);
     public record ChannelPatch(
         string? Name, string? Icon, string? ApplianceType,
@@ -14,6 +14,45 @@ public static class DeviceEndpoints
 
     public static void Map(IEndpointRouteBuilder app)
     {
+        // Unclaimed / self-provisioned devices (admin only).
+        app.MapGet("/api/admin/unclaimed-devices", async (HttpContext ctx, NpgsqlDataSource db, CurrentUserService cus) =>
+        {
+            var user = await cus.ResolveAsync(ctx.User);
+            if (user is null) return Results.Unauthorized();
+            if (!user.IsAdmin) return Results.Forbid();
+
+            await using var conn = await db.OpenConnectionAsync();
+
+            var devices = (await conn.QueryAsync(
+                """
+                SELECT id, home_id AS homeid, room_id AS roomid, name, hardware_id AS hardwareid,
+                       relay_count AS relaycount, is_online AS isonline, last_seen_at AS lastseenat,
+                       firmware_version AS firmwareversion, boot_count AS bootcount,
+                       rssi_dbm AS rssidbm, free_heap_bytes AS freeheapbytes, created_at AS createdat
+                FROM devices WHERE home_id IS NULL ORDER BY created_at DESC
+                """)).AsList();
+
+            var channels = (await conn.QueryAsync(
+                """
+                SELECT c.id, c.device_id AS deviceid, c.channel_no AS channelno, c.name, c.icon,
+                       c.appliance_type AS appliancetype, c.is_favorite AS isfavorite,
+                       c.sort_index AS sortindex, c.usage_count AS usagecount, c.last_used_at AS lastusedat
+                FROM device_channels c
+                JOIN devices d ON d.id = c.device_id
+                WHERE d.home_id IS NULL
+                ORDER BY c.device_id, c.channel_no
+                """)).AsList();
+
+            var byDevice = channels.GroupBy(c => (Guid)c.deviceid).ToDictionary(g => g.Key, g => g.ToList());
+            var result = devices.Select(d => new
+            {
+                d.id, d.homeid, d.roomid, d.name, d.hardwareid, d.relaycount, d.isonline,
+                d.lastseenat, d.firmwareversion, d.bootcount, d.rssidbm, d.freeheapbytes, d.createdat,
+                channels = byDevice.TryGetValue((Guid)d.id, out var ch) ? ch : []
+            });
+            return Results.Ok(result);
+        }).RequireAuthorization();
+
         var homeGroup = app.MapGroup("/api/homes/{homeId:guid}/devices").RequireAuthorization();
 
         // List devices for a home, channels included.
@@ -132,13 +171,18 @@ public static class DeviceEndpoints
             if (user is null) return Results.Unauthorized();
 
             await using var conn = await db.OpenConnectionAsync();
-            var homeId = await conn.ExecuteScalarAsync<Guid?>(
-                "SELECT home_id FROM devices WHERE id = @deviceId", new { deviceId });
-            if (homeId is null) return Results.NotFound();
-            if (!await Access.CanAccessHomeAsync(conn, user, homeId.Value)) return Results.Forbid();
+            var existing = await conn.QuerySingleOrDefaultAsync<(Guid? HomeId, bool Claimed)>(
+                "SELECT home_id AS HomeId, claimed AS Claimed FROM devices WHERE id = @deviceId", new { deviceId });
+            if (existing == default) return Results.NotFound();
 
-            // Structural changes (room move, relay count) are admin-only; rename is member-level.
-            if ((input.RoomId is not null || input.RelayCount is not null) && !user.IsAdmin)
+            if (!user.IsAdmin)
+            {
+                if (existing.HomeId is null || !await Access.CanAccessHomeAsync(conn, user, existing.HomeId.Value))
+                    return Results.Forbid();
+            }
+
+            // Structural changes (home move, room move, relay count) are admin-only; rename is member-level.
+            if ((input.HomeId is not null || input.RoomId is not null || input.RelayCount is not null) && !user.IsAdmin)
                 return Results.Forbid();
 
             await using var tx = await conn.BeginTransactionAsync();
@@ -146,12 +190,14 @@ public static class DeviceEndpoints
             var device = await conn.QuerySingleAsync(
                 """
                 UPDATE devices SET name = COALESCE(@name, name),
+                                   home_id = COALESCE(@homeId, home_id),
                                    room_id = COALESCE(@roomId, room_id),
-                                   relay_count = COALESCE(@relayCount, relay_count)
+                                   relay_count = COALESCE(@relayCount, relay_count),
+                                   claimed = CASE WHEN @homeId IS NOT NULL THEN true ELSE claimed END
                 WHERE id = @deviceId
-                RETURNING id, home_id AS homeid, room_id AS roomid, name, relay_count AS relaycount
+                RETURNING id, home_id AS homeid, room_id AS roomid, name, relay_count AS relaycount, claimed
                 """,
-                new { deviceId, name = input.Name?.Trim(), roomId = input.RoomId, relayCount = input.RelayCount }, tx);
+                new { deviceId, name = input.Name?.Trim(), homeId = input.HomeId, roomId = input.RoomId, relayCount = input.RelayCount }, tx);
 
             if (input.RelayCount is int newCount)
             {
@@ -172,67 +218,8 @@ public static class DeviceEndpoints
             return Results.Ok(device);
         });
 
-        deviceGroup.MapDelete("/", async (HttpContext ctx, Guid deviceId, NpgsqlDataSource db, CurrentUserService cus, EmqxAdminService emqx) =>
-        {
-            var user = await cus.ResolveAsync(ctx.User);
-            if (user is null) return Results.Unauthorized();
-            if (!user.IsAdmin) return Results.Forbid();
-
-            await using var conn = await db.OpenConnectionAsync();
-            var hardwareId = await conn.ExecuteScalarAsync<string?>(
-                "SELECT hardware_id FROM devices WHERE id = @deviceId", new { deviceId });
-            if (hardwareId is null) return Results.NotFound();
-
-            await conn.ExecuteAsync("DELETE FROM devices WHERE id = @deviceId", new { deviceId });
-            await emqx.DeleteAsync(hardwareId);   // revoke the broker credential
-            return Results.NoContent();
-        });
-
-        // Fetch a board's MQTT credential (admin only) — for flashing / Board Setup.
-        deviceGroup.MapGet("/credentials", async (HttpContext ctx, Guid deviceId, NpgsqlDataSource db, CurrentUserService cus) =>
-        {
-            var user = await cus.ResolveAsync(ctx.User);
-            if (user is null) return Results.Unauthorized();
-            if (!user.IsAdmin) return Results.Forbid();
-
-            await using var conn = await db.OpenConnectionAsync();
-            var cred = await conn.QuerySingleOrDefaultAsync(
-                """
-                SELECT hardware_id AS hardwareid, mqtt_username AS mqttusername, mqtt_password AS mqttpassword
-                FROM devices WHERE id = @deviceId
-                """, new { deviceId });
-            return cred is null ? Results.NotFound() : Results.Ok(cred);
-        });
-
-        // Rotate a board's MQTT credential (admin only). Old password stops working.
-        deviceGroup.MapPost("/credentials/rotate", async (HttpContext ctx, Guid deviceId, NpgsqlDataSource db, CurrentUserService cus, EmqxAdminService emqx) =>
-        {
-            var user = await cus.ResolveAsync(ctx.User);
-            if (user is null) return Results.Unauthorized();
-            if (!user.IsAdmin) return Results.Forbid();
-            if (!emqx.IsEnabled) return Results.Problem(title: "MQTT provisioning not configured", statusCode: StatusCodes.Status503ServiceUnavailable);
-
-            await using var conn = await db.OpenConnectionAsync();
-            var hardwareId = await conn.ExecuteScalarAsync<string?>(
-                "SELECT hardware_id FROM devices WHERE id = @deviceId", new { deviceId });
-            if (hardwareId is null) return Results.NotFound();
-
-            var cred = await emqx.ProvisionAsync(hardwareId);
-            if (cred is null) return Results.Problem(title: "provisioning failed", statusCode: StatusCodes.Status502BadGateway);
-
-            await conn.ExecuteAsync(
-                "UPDATE devices SET mqtt_username = @u, mqtt_password = @p WHERE id = @deviceId",
-                new { u = cred.Username, p = cred.Password, deviceId });
-            return Results.Ok(new { hardwareid = hardwareId, mqttusername = cred.Username, mqttpassword = cred.Password });
-        });
-
-        // ---- channel state ------------------------------------------------------
-        // Postgres holds last-known/desired relay state in devices.state jsonb
-        // ({"relay1": true, ...}). Today the dashboard polls; when the MQTT layer
-        // lands, the toggle endpoint additionally publishes and devices report
-        // actual state back. Contract stays stable for the frontends.
-
-        app.MapGet("/api/homes/{homeId:guid}/state", async (HttpContext ctx, Guid homeId, NpgsqlDataSource db, CurrentUserService cus) =>
+        // Get relay states for a home.
+        app.MapGet("/api/homes/{homeId:guid}/relay-states", async (HttpContext ctx, Guid homeId, NpgsqlDataSource db, CurrentUserService cus) =>
         {
             var user = await cus.ResolveAsync(ctx.User);
             if (user is null) return Results.Unauthorized();
@@ -243,7 +230,7 @@ public static class DeviceEndpoints
             var rows = await conn.QueryAsync<(Guid ChannelId, bool? On)>(
                 """
                 SELECT c.id AS ChannelId,
-                       (d.state ->> ('relay' || c.channel_no))::boolean AS "On"
+                       (d.state ->> ('relay' || c.channel_no::text))::boolean AS On
                 FROM device_channels c
                 JOIN devices d ON d.id = c.device_id
                 WHERE d.home_id = @homeId

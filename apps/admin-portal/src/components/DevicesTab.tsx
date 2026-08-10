@@ -26,13 +26,17 @@ export default function DevicesTab({
   focusDeviceId: string | null;
 }) {
   const [bundles, setBundles] = useState<HomeBundle[] | null>(null);
+  const [unclaimedDevices, setUnclaimedDevices] = useState<Device[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [showRegister, setShowRegister] = useState(false);
   const focusedOnce = useRef(false);
 
   const load = useCallback(async () => {
     try {
-      const homes = await apiFetch<HomeSummary[]>("/api/homes");
+      const [homes, unclaimed] = await Promise.all([
+        apiFetch<HomeSummary[]>("/api/homes").catch(() => [] as HomeSummary[]),
+        apiFetch<Device[]>("/api/admin/unclaimed-devices").catch(() => [] as Device[]),
+      ]);
       const loaded = await Promise.all(
         homes.map(async (home) => {
           const [rooms, devices] = await Promise.all([
@@ -47,10 +51,12 @@ export default function DevicesTab({
         }),
       );
       setBundles(loaded);
+      setUnclaimedDevices(unclaimed);
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load devices");
       setBundles([]);
+      setUnclaimedDevices([]);
     }
   }, []);
 
@@ -60,13 +66,15 @@ export default function DevicesTab({
 
   // Scroll to a device opened from the Houses tab (once, after first load).
   useEffect(() => {
-    if (!focusDeviceId || !bundles || focusedOnce.current) return;
+    if (!focusDeviceId || (!bundles && unclaimedDevices.length === 0) || focusedOnce.current) return;
     focusedOnce.current = true;
     const el = document.getElementById(`device-${focusDeviceId}`);
     el?.scrollIntoView({ behavior: "smooth", block: "start" });
-  }, [focusDeviceId, bundles]);
+  }, [focusDeviceId, bundles, unclaimedDevices]);
 
-  const totalDevices = bundles?.reduce((n, b) => n + b.devices.length, 0) ?? 0;
+  const totalHomeDevices = bundles?.reduce((n, b) => n + b.devices.length, 0) ?? 0;
+  const totalDevices = totalHomeDevices + unclaimedDevices.length;
+  const allHomes = bundles?.map((b) => b.home) ?? [];
 
   return (
     <div>
@@ -78,7 +86,9 @@ export default function DevicesTab({
 
       <div className="mb-4 flex items-center justify-between">
         <p className="text-sm text-gray-500">
-          {bundles === null ? "Loading…" : `${totalDevices} device${totalDevices === 1 ? "" : "s"} across ${bundles.length} home${bundles.length === 1 ? "" : "s"}`}
+          {bundles === null
+            ? "Loading…"
+            : `${totalDevices} device${totalDevices === 1 ? "" : "s"}${unclaimedDevices.length > 0 ? ` (${unclaimedDevices.length} unclaimed)` : ""} across ${bundles.length} home${bundles.length === 1 ? "" : "s"}`}
         </p>
         <button
           onClick={() => setShowRegister(true)}
@@ -94,6 +104,29 @@ export default function DevicesTab({
         </div>
       )}
 
+      {unclaimedDevices.length > 0 && (
+        <div className="mb-8">
+          <h2 className="mb-4 text-sm font-semibold uppercase text-gray-400">
+            Unclaimed Devices
+          </h2>
+          <div className="space-y-4">
+            {unclaimedDevices.map((device) => (
+              <DeviceCard
+                key={device.id}
+                device={device}
+                home={{ id: null, name: "Unclaimed" } as unknown as HomeSummary}
+                rooms={[]}
+                allHomes={allHomes}
+                highlighted={device.id === focusDeviceId}
+                onError={setError}
+                onChanged={load}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Claimed / Home-Assigned Devices Section */}
       <div className="space-y-4">
         {bundles?.map((bundle) =>
           bundle.devices.map((device) => (
@@ -102,6 +135,7 @@ export default function DevicesTab({
               device={device}
               home={bundle.home}
               rooms={bundle.rooms}
+              allHomes={allHomes}
               highlighted={device.id === focusDeviceId}
               onError={setError}
               onChanged={load}
@@ -178,7 +212,10 @@ function FlashCredentials({ deviceId }: { deviceId: string }) {
           {snippet ? (
             <>
               <p className="mb-2 text-xs text-gray-400">
-                Paste into <code>sketch_july21/secrets.h</code> (plus your WiFi), then flash:
+                Paste into your firmware&apos;s <code>secrets.h</code> (plus your WiFi),
+                then flash. Only needed for firmware with compiled-in credentials —
+                boards running the self-provisioning firmware fetch these
+                automatically and need nothing pasted here:
               </p>
               <pre className="overflow-x-auto whitespace-pre-wrap break-all font-mono text-xs text-green-300">
                 {snippet}
@@ -200,6 +237,7 @@ function DeviceCard({
   device,
   home,
   rooms,
+  allHomes,
   highlighted,
   onError,
   onChanged,
@@ -207,6 +245,7 @@ function DeviceCard({
   device: Device;
   home: HomeSummary;
   rooms: Room[];
+  allHomes?: HomeSummary[];
   highlighted: boolean;
   onError: (message: string | null) => void;
   onChanged: () => Promise<void> | void;
@@ -280,27 +319,48 @@ function DeviceCard({
         </code>
         <OnlineBadge online={device.isonline} />
         <span className="text-sm text-gray-500">
-          {home.name}
-          {roomName ? ` · ${roomName}` : ""}
+          {home.id ? `${home.name}${roomName ? ` · ${roomName}` : ""}` : "Unclaimed"}
         </span>
         <div className="ml-auto flex items-center gap-2">
-          <label className="text-xs text-gray-500">
-            Room{" "}
-            <select
-              value={device.roomid ?? ""}
-              onChange={(e) =>
-                void patchDevice({ roomId: e.target.value || null })
-              }
-              className="rounded-lg border border-gray-300 px-2 py-1 text-sm focus:border-blue-500 focus:outline-none"
-            >
-              <option value="">Unassigned</option>
-              {rooms.map((r) => (
-                <option key={r.id} value={r.id}>
-                  {r.name}
-                </option>
-              ))}
-            </select>
-          </label>
+          {allHomes && allHomes.length > 0 && (
+            <label className="text-xs text-gray-500">
+              Home{" "}
+              <select
+                value={device.homeid ?? ""}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  if (val) void patchDevice({ homeId: val });
+                }}
+                className="rounded-lg border border-gray-300 px-2 py-1 text-sm focus:border-blue-500 focus:outline-none"
+              >
+                <option value="">Unassigned</option>
+                {allHomes.map((h) => (
+                  <option key={h.id} value={h.id}>
+                    {h.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          {rooms.length > 0 && (
+            <label className="text-xs text-gray-500">
+              Room{" "}
+              <select
+                value={device.roomid ?? ""}
+                onChange={(e) =>
+                  void patchDevice({ roomId: e.target.value || null })
+                }
+                className="rounded-lg border border-gray-300 px-2 py-1 text-sm focus:border-blue-500 focus:outline-none"
+              >
+                <option value="">Unassigned</option>
+                {rooms.map((r) => (
+                  <option key={r.id} value={r.id}>
+                    {r.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
           <label className="text-xs text-gray-500">
             Relays{" "}
             <select
