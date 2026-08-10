@@ -24,6 +24,7 @@ public sealed class MqttService : BackgroundService
 
     public bool IsEnabled => !string.IsNullOrWhiteSpace(_host);
     public bool IsConnected => _client?.IsConnected ?? false;
+    public event Action<string, int, bool>? OnRelayStateChanged;
 
     public MqttService(NpgsqlDataSource db, ILogger<MqttService> logger)
     {
@@ -121,6 +122,8 @@ public sealed class MqttService : BackgroundService
                         last_seen_at = now(), is_online = true
                     WHERE hardware_id = @hardwareId
                     """, new { hardwareId, channelNo, on });
+
+                OnRelayStateChanged?.Invoke(hardwareId, channelNo, on);
                 return;
             }
 

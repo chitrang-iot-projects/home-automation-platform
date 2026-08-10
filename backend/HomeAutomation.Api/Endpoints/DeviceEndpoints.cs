@@ -282,6 +282,65 @@ public static class DeviceEndpoints
         app.MapGet("/api/homes/{homeId:guid}/state", GetHomeStateAsync).RequireAuthorization();
         app.MapGet("/api/homes/{homeId:guid}/relay-states", GetHomeStateAsync).RequireAuthorization();
 
+        // Real-time SSE stream for instant (< 50ms) state updates on Customer PWA.
+        app.MapGet("/api/homes/{homeId:guid}/state/stream", async (HttpContext ctx, Guid homeId, NpgsqlDataSource db, CurrentUserService cus, MqttService mqtt, CancellationToken ct) =>
+        {
+            var user = await cus.ResolveAsync(ctx.User);
+            if (user is null) return Results.Unauthorized();
+
+            await using var conn = await db.OpenConnectionAsync();
+            if (!await Access.CanAccessHomeAsync(conn, user, homeId)) return Results.Forbid();
+
+            var channelMapRows = await conn.QueryAsync<(string HardwareId, int ChannelNo, Guid ChannelId)>(
+                """
+                SELECT d.hardware_id AS HardwareId, c.channel_no AS ChannelNo, c.id AS ChannelId
+                FROM device_channels c
+                JOIN devices d ON d.id = c.device_id
+                WHERE d.home_id = @homeId
+                """, new { homeId });
+
+            var channelLookup = channelMapRows.ToDictionary(r => (r.HardwareId, r.ChannelNo), r => r.ChannelId);
+
+            ctx.Response.Headers.ContentType = "text/event-stream";
+            ctx.Response.Headers.CacheControl = "no-cache";
+            ctx.Response.Headers.Connection = "keep-alive";
+
+            Action<string, int, bool> handler = async (hwId, channelNo, on) =>
+            {
+                if (channelLookup.TryGetValue((hwId, channelNo), out var channelId))
+                {
+                    try
+                    {
+                        var payload = System.Text.Json.JsonSerializer.Serialize(new { channelId, on });
+                        await ctx.Response.WriteAsync($"data: {payload}\n\n", ct);
+                        await ctx.Response.Body.FlushAsync(ct);
+                    }
+                    catch { }
+                }
+            };
+
+            mqtt.OnRelayStateChanged += handler;
+            try
+            {
+                await ctx.Response.WriteAsync(": keepalive\n\n", ct);
+                await ctx.Response.Body.FlushAsync(ct);
+
+                while (!ct.IsCancellationRequested)
+                {
+                    await Task.Delay(15000, ct);
+                    await ctx.Response.WriteAsync(": keepalive\n\n", ct);
+                    await ctx.Response.Body.FlushAsync(ct);
+                }
+            }
+            catch { }
+            finally
+            {
+                mqtt.OnRelayStateChanged -= handler;
+            }
+
+            return Results.Empty;
+        }).RequireAuthorization();
+
         app.MapPost("/api/channels/{channelId:guid}/toggle", async (HttpContext ctx, Guid channelId, TogglePayload payload, NpgsqlDataSource db, CurrentUserService cus) =>
         {
             var user = await cus.ResolveAsync(ctx.User);
