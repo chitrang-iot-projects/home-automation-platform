@@ -1,59 +1,35 @@
-# Maintenance
+# Engineering Maintenance Log
 
-This document preserves useful engineering context between AI-agent sessions. It is not a conversation transcript. Summarize investigations, changes, validation, and remaining work; never copy a full AI conversation.
+## Current Work & State
+- **Date:** 2026-08-10
+- **Primary Goal:** Unclaimed board visibility, device deletion fix, and Customer PWA real-time state sync.
 
-## Current State
+### Active Issues & Root Cause Analysis
 
-Self-provisioning firmware (`July_24072026.ino`) creates unclaimed devices in PostgreSQL with `home_id = NULL`.
-The API and Admin Portal now support querying, displaying, and managing unclaimed devices.
+1. **Unclaimed Board Visibility**
+   - **Problem:** Self-provisioned ESP32 boards (`home_id IS NULL`) were invisible in the Admin Portal.
+   - **Fix:** Implemented `GET /api/admin/unclaimed-devices` and added an **Unclaimed Devices** section with home reassignment controls in `DevicesTab.tsx`.
 
-## Active / In-Progress Work
+2. **Device Deletion Failure**
+   - **Problem:** Clicking "Delete" in the Admin Portal failed with 404/405 error.
+   - **Root Cause:** `deviceGroup.MapDelete("/", ...)` handler was missing from `DeviceEndpoints.cs`.
+   - **Fix:** Restored `MapDelete` handler, verified DB record deletion and EMQX MQTT credential revocation. Deleted `esp32-000000000000` and `esp32-3076f5b92894`.
 
-None.
+3. **Customer PWA Touch Switch State Sync Issue**
+   - **Problem:** Pressing physical touch switches toggled lights, but the virtual switches on Customer PWA (`https://home-automation-platform-gilt.vercel.app/`) did not update state.
+   - **Root Cause:** Route name mismatch between frontend state hook (`useChannelStates.ts`) and ASP.NET Core API (`DeviceEndpoints.cs`). The hook polled `GET /api/homes/{homeId}/state`, but the backend only registered `/api/homes/{homeId}/relay-states`, returning 404 on every poll.
+   - **Fix:** Mapped both `/api/homes/{homeId}/state` and `/api/homes/{homeId}/relay-states` to `GetHomeStateAsync` in `DeviceEndpoints.cs`.
 
-## Known Issues
+4. **Render Deployment HostBuilder Inotify Crash**
+   - **Problem:** `WebApplication.CreateBuilder` crashed on Linux container startup with `System.IO.IOException: The configured user limit (128) on the number of inotify instances has been reached`.
+   - **Fix:** Added `Environment.SetEnvironmentVariable("DOTNET_HOSTBUILDER__RELOADCONFIGONCHANGE", "false");` in `Program.cs` and `ENV DOTNET_HOSTBUILDER__RELOADCONFIGONCHANGE=false` in `Dockerfile`.
 
-None.
+---
 
-## Pending Work
+## Git & Branching State
 
-- Deploy updated API service to Render.
-- Deploy updated Admin Portal app to Vercel.
-
-## Recent Work
-
-### 2026-08-10 — Display & Manage Unclaimed Devices in Admin Portal
-
-#### Request
-Unclaimed self-provisioned devices (`home_id = NULL`) were not appearing in the Admin Portal. Identify the root cause and implement a fix.
-
-#### Investigation
-- Found that `POST /api/provision` creates device rows with `home_id = NULL`.
-- `GET /api/homes/{homeId}/devices` only returned devices for a specific `home_id`.
-- `DevicesTab.tsx` loaded devices home-by-home, skipping any device where `home_id IS NULL`.
-
-#### Changes
-- **`backend/HomeAutomation.Api/Endpoints/DeviceEndpoints.cs`**:
-  - Added `GET /api/admin/unclaimed-devices` (Admin-only) returning devices and channels where `home_id IS NULL`.
-  - Updated `PATCH /api/devices/{id}` to support assigning/updating `homeId`.
-- **`apps/admin-portal/src/components/DevicesTab.tsx`**:
-  - Updated `load()` to fetch `/api/admin/unclaimed-devices` alongside home bundles.
-  - Added an **"Unclaimed / Self-Provisioned Devices"** section at the top of `DevicesTab`.
-  - Allowed assigning any unclaimed device to a home directly via the UI.
-
-#### Validation
-- `dotnet build` passed with 0 errors and 0 warnings.
-- `next build` (`npm run build` in `apps/admin-portal`) passed with 0 errors and 0 warnings.
-
-#### Remaining Work
-- Push/deploy updated API to Render and Admin Portal to Vercel.
-
-#### Notes for Future Agents
-- Self-provisioned boards initially have `home_id = NULL` and `claimed = false`.
-- The Admin Portal now queries `/api/admin/unclaimed-devices` so these boards are immediately visible as soon as they complete captive portal setup.
-
-## Important Discoveries
-- Devices created via `/api/provision` remain unclaimed until a customer claims them via `/api/devices/claim` or an admin assigns a home.
-
-## Handoff Notes
-- All code changes are compiled and verified locally. Ready for deployment.
+- **`home-automation-platform`:**
+  - `develop`: Pushed and up-to-date (`commit 45768c6`).
+  - `main`: Merged and pushed (`commit 45768c6`). Auto-deploying to Vercel and Render.
+- **`esp32-iot-framework`:**
+  - `phase-one`: Pushed and up-to-date (`commit 87fc393`). Clean B805 plug-and-play firmware architecture.
