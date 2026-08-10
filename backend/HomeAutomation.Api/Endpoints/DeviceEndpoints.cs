@@ -278,25 +278,9 @@ public static class DeviceEndpoints
 
         // ---- device state / commands ------------------------------------------
 
-        app.MapGet("/api/homes/{homeId:guid}/relay-states", async (HttpContext ctx, Guid homeId, NpgsqlDataSource db, CurrentUserService cus) =>
-        {
-            var user = await cus.ResolveAsync(ctx.User);
-            if (user is null) return Results.Unauthorized();
-
-            await using var conn = await db.OpenConnectionAsync();
-            if (!await Access.CanAccessHomeAsync(conn, user, homeId)) return Results.Forbid();
-
-            var rows = await conn.QueryAsync<(Guid ChannelId, bool? On)>(
-                """
-                SELECT c.id AS ChannelId,
-                       (d.state ->> ('relay' || c.channel_no::text))::boolean AS On
-                FROM device_channels c
-                JOIN devices d ON d.id = c.device_id
-                WHERE d.home_id = @homeId
-                """, new { homeId });
-
-            return Results.Ok(new { states = rows.ToDictionary(r => r.ChannelId, r => r.On ?? false) });
-        }).RequireAuthorization();
+        // Get channel states for a home (used by Customer PWA polling).
+        app.MapGet("/api/homes/{homeId:guid}/state", GetHomeStateAsync).RequireAuthorization();
+        app.MapGet("/api/homes/{homeId:guid}/relay-states", GetHomeStateAsync).RequireAuthorization();
 
         app.MapPost("/api/channels/{channelId:guid}/toggle", async (HttpContext ctx, Guid channelId, TogglePayload payload, NpgsqlDataSource db, CurrentUserService cus) =>
         {
@@ -385,5 +369,25 @@ public static class DeviceEndpoints
                 });
             return Results.Ok(channel);
         }).RequireAuthorization();
+    }
+
+    private static async Task<IResult> GetHomeStateAsync(HttpContext ctx, Guid homeId, NpgsqlDataSource db, CurrentUserService cus)
+    {
+        var user = await cus.ResolveAsync(ctx.User);
+        if (user is null) return Results.Unauthorized();
+
+        await using var conn = await db.OpenConnectionAsync();
+        if (!await Access.CanAccessHomeAsync(conn, user, homeId)) return Results.Forbid();
+
+        var rows = await conn.QueryAsync<(Guid ChannelId, bool? On)>(
+            """
+            SELECT c.id AS ChannelId,
+                   (d.state ->> ('relay' || c.channel_no::text))::boolean AS On
+            FROM device_channels c
+            JOIN devices d ON d.id = c.device_id
+            WHERE d.home_id = @homeId
+            """, new { homeId });
+
+        return Results.Ok(new { states = rows.ToDictionary(r => r.ChannelId, r => r.On ?? false) });
     }
 }
