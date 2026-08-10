@@ -5,7 +5,7 @@ import { apiGet } from "@/lib/api";
 import { auth } from "@/lib/firebase";
 import type { ChannelStatesResponse } from "@/lib/types";
 
-const POLL_INTERVAL_MS = 1500; // Fast 1.5s background poll fallback
+const POLL_INTERVAL_MS = 1000; // Fast 1-second fallback poll
 const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_URL ?? "https://home-automation-api-yonj.onrender.com";
 
@@ -17,10 +17,10 @@ export interface UseChannelStatesResult {
 }
 
 /**
-  * Real-time channel state hook:
-  * 1. Listens to instant (< 50ms) Server-Sent Events (SSE) from /api/homes/{homeId}/state/stream
-  * 2. Runs a 1.5s HTTP background poll as fallback if SSE connection drops
-  */
+ * Real-time channel state hook:
+ * 1. Opens an instant (< 50ms) Server-Sent Events (SSE) stream from /api/homes/{homeId}/state/stream
+ * 2. Runs a 1s background HTTP poll as a failsafe fallback
+ */
 export function useChannelStates(homeId: string | null): UseChannelStatesResult {
   const [states, setStates] = useState<Record<string, boolean>>({});
   const overridesRef = useRef<Record<string, boolean>>({});
@@ -47,7 +47,7 @@ export function useChannelStates(homeId: string | null): UseChannelStatesResult 
         }
         setStates({ ...server, ...overrides });
       } catch {
-        // Transient poll error — backup timer retries
+        // Transient error — backup timer retries
       }
     }
 
@@ -59,8 +59,16 @@ export function useChannelStates(homeId: string | null): UseChannelStatesResult 
 
     async function startStream() {
       try {
-        const user = auth.currentUser;
-        if (!user) return;
+        // Wait for Firebase auth to initialize if still null
+        let user = auth.currentUser;
+        let attempts = 0;
+        while (!user && attempts < 10 && !cancelled) {
+          await new Promise((r) => setTimeout(r, 500));
+          user = auth.currentUser;
+          attempts++;
+        }
+        if (!user || cancelled) return;
+
         const token = await user.getIdToken();
         if (cancelled) return;
 
@@ -70,7 +78,16 @@ export function useChannelStates(homeId: string | null): UseChannelStatesResult 
           signal: abortController.signal,
         });
 
-        if (!res.ok || !res.body) return;
+        if (!res.ok || !res.body) {
+          // Re-attempt after delay if server returned error
+          if (!cancelled) {
+            setTimeout(() => {
+              if (!cancelled) void startStream();
+            }, 3000);
+          }
+          return;
+        }
+
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
         let buffer = "";
@@ -98,7 +115,12 @@ export function useChannelStates(homeId: string | null): UseChannelStatesResult 
           }
         }
       } catch {
-        // Stream closed or disconnected — polling backup will handle updates until reconnected
+        // Stream disconnected — auto reconnect after 3 seconds
+        if (!cancelled) {
+          setTimeout(() => {
+            if (!cancelled) void startStream();
+          }, 3000);
+        }
       }
     }
 
