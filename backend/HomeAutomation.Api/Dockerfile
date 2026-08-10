@@ -16,6 +16,8 @@ COPY --from=build /app .
 
 # Render (and most container hosts) route traffic to the port the app listens on
 ENV ASPNETCORE_URLS=http://+:8080
+ENV DOTNET_HOSTBUILDER__RELOADCONFIGONCHANGE=false
+ENV DOTNET_USE_POLLING_FILE_WATCHER=true
 EXPOSE 8080
 
 ENTRYPOINT ["dotnet", "HomeAutomation.Api.dll"]

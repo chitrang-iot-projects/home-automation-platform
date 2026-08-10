@@ -4,6 +4,9 @@ using HomeAutomation.Api.Infrastructure;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Npgsql;
 
+// Disable file watching for appsettings in production container environments (prevents inotify limit crashes on Render).
+Environment.SetEnvironmentVariable("DOTNET_HOSTBUILDER__RELOADCONFIGONCHANGE", "false");
+
 var builder = WebApplication.CreateBuilder(args);
 
 // DATABASE_URL is provided as an environment variable (Render → Environment).
