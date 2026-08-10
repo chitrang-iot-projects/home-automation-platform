@@ -70,7 +70,7 @@ public static class DeviceEndpoints
                        relay_count AS relaycount, is_online AS isonline, last_seen_at AS lastseenat,
                        firmware_version AS firmwareversion, boot_count AS bootcount,
                        rssi_dbm AS rssidbm, free_heap_bytes AS freeheapbytes, created_at AS createdat
-                FROM devices WHERE home_id = @homeId ORDER BY name
+                FROM devices WHERE home_id = @homeId ORDER BY created_at
                 """, new { homeId })).AsList();
 
             var channels = (await conn.QueryAsync(
@@ -91,59 +91,60 @@ public static class DeviceEndpoints
                 d.lastseenat, d.firmwareversion, d.bootcount, d.rssidbm, d.freeheapbytes, d.createdat,
                 channels = byDevice.TryGetValue((Guid)d.id, out var ch) ? ch : []
             });
+
             return Results.Ok(result);
         });
 
-        // Register a board (admin). Auto-creates channel rows 1..relay_count and
-        // provisions a unique, topic-scoped MQTT credential in EMQX.
+        // Register a new device under a home.
         homeGroup.MapPost("/", async (HttpContext ctx, Guid homeId, DeviceInput input, NpgsqlDataSource db, CurrentUserService cus, EmqxAdminService emqx) =>
         {
             var user = await cus.ResolveAsync(ctx.User);
             if (user is null) return Results.Unauthorized();
             if (!user.IsAdmin) return Results.Forbid();
-            if (string.IsNullOrWhiteSpace(input.Name)) return Results.BadRequest(new { error = "name is required" });
-
-            var relayCount = input.RelayCount ?? 4;
-            if (relayCount is < 1 or > 16) return Results.BadRequest(new { error = "relayCount must be 1..16" });
-
-            // Hardware ID is the board's assigned identity (used in MQTT topics and
-            // flashed into the firmware). If the admin leaves it blank, the platform
-            // assigns a unique one — no need to read anything off the chip.
-            var hardwareId = string.IsNullOrWhiteSpace(input.HardwareId)
-                ? $"esp32-{Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(6)).ToLowerInvariant()}"
-                : input.HardwareId.Trim();
 
             await using var conn = await db.OpenConnectionAsync();
+
+            var count = input.RelayCount ?? 4;
+            if (count is < 1 or > 16)
+                return Results.BadRequest(new { error = "relayCount must be between 1 and 16" });
+
+            var hardwareId = input.HardwareId?.Trim();
+            if (string.IsNullOrWhiteSpace(hardwareId))
+            {
+                hardwareId = "esp32-" + Guid.NewGuid().ToString("N")[..12];
+            }
+
+            var existing = await conn.QuerySingleOrDefaultAsync<Guid?>(
+                "SELECT id FROM devices WHERE hardware_id = @hardwareId", new { hardwareId });
+            if (existing is not null)
+                return Results.Conflict(new { error = "hardwareId already registered" });
+
             await using var tx = await conn.BeginTransactionAsync();
-            Guid deviceId;
-            try
-            {
-                var row = await conn.QuerySingleAsync(
-                    """
-                    INSERT INTO devices (home_id, room_id, type_code, name, hardware_id, relay_count)
-                    VALUES (@homeId, @roomId, 'controller', @name, @hardwareId, @relayCount)
-                    RETURNING id
-                    """,
-                    new { homeId, roomId = input.RoomId, name = input.Name.Trim(), hardwareId, relayCount },
-                    tx);
-                deviceId = (Guid)row.id;
 
-                for (var n = 1; n <= relayCount; n++)
+            var deviceId = await conn.QuerySingleAsync<Guid>(
+                """
+                INSERT INTO devices (home_id, room_id, name, hardware_id, relay_count, claimed)
+                VALUES (@homeId, @roomId, @name, @hardwareId, @count, true)
+                RETURNING id
+                """,
+                new
                 {
-                    await conn.ExecuteAsync(
-                        "INSERT INTO device_channels (device_id, channel_no, name) VALUES (@deviceId, @n, @name)",
-                        new { deviceId, n, name = $"Switch {n}" }, tx);
-                }
+                    homeId,
+                    roomId = input.RoomId,
+                    name = string.IsNullOrWhiteSpace(input.Name) ? "Smart Switch Board" : input.Name.Trim(),
+                    hardwareId,
+                    count
+                }, tx);
 
-                await tx.CommitAsync();
-            }
-            catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UniqueViolation)
-            {
-                await tx.RollbackAsync();
-                return Results.Conflict(new { error = "a device with this hardware id already exists" });
-            }
+            await conn.ExecuteAsync(
+                """
+                INSERT INTO device_channels (device_id, channel_no, name)
+                SELECT @deviceId, n, 'Switch ' || n
+                FROM generate_series(1, @count) AS n
+                """, new { deviceId, count }, tx);
 
-            // Provision the MQTT credential outside the DB transaction (external call).
+            await tx.CommitAsync();
+
             var cred = await emqx.ProvisionAsync(hardwareId);
             if (cred is not null)
             {
@@ -218,7 +219,65 @@ public static class DeviceEndpoints
             return Results.Ok(device);
         });
 
-        // Get relay states for a home.
+        // Delete a board (admin only).
+        deviceGroup.MapDelete("/", async (HttpContext ctx, Guid deviceId, NpgsqlDataSource db, CurrentUserService cus, EmqxAdminService emqx) =>
+        {
+            var user = await cus.ResolveAsync(ctx.User);
+            if (user is null) return Results.Unauthorized();
+            if (!user.IsAdmin) return Results.Forbid();
+
+            await using var conn = await db.OpenConnectionAsync();
+            var hardwareId = await conn.ExecuteScalarAsync<string?>(
+                "SELECT hardware_id FROM devices WHERE id = @deviceId", new { deviceId });
+            if (hardwareId is null) return Results.NotFound();
+
+            await conn.ExecuteAsync("DELETE FROM devices WHERE id = @deviceId", new { deviceId });
+            await emqx.DeleteAsync(hardwareId);   // revoke the broker credential
+            return Results.NoContent();
+        });
+
+        // Fetch a board's MQTT credential (admin only) — for flashing / Board Setup.
+        deviceGroup.MapGet("/credentials", async (HttpContext ctx, Guid deviceId, NpgsqlDataSource db, CurrentUserService cus) =>
+        {
+            var user = await cus.ResolveAsync(ctx.User);
+            if (user is null) return Results.Unauthorized();
+            if (!user.IsAdmin) return Results.Forbid();
+
+            await using var conn = await db.OpenConnectionAsync();
+            var cred = await conn.QuerySingleOrDefaultAsync<(string HardwareId, string? MqttUsername, string? MqttPassword)>(
+                """
+                SELECT hardware_id AS HardwareId, mqtt_username AS MqttUsername, mqtt_password AS MqttPassword
+                FROM devices WHERE id = @deviceId
+                """, new { deviceId });
+            if (cred == default) return Results.NotFound();
+            return Results.Ok(new { hardwareid = cred.HardwareId, mqttusername = cred.MqttUsername, mqttpassword = cred.MqttPassword });
+        });
+
+        // Rotate a board's MQTT credential (admin only).
+        deviceGroup.MapPost("/credentials/rotate", async (HttpContext ctx, Guid deviceId, NpgsqlDataSource db, CurrentUserService cus, EmqxAdminService emqx) =>
+        {
+            var user = await cus.ResolveAsync(ctx.User);
+            if (user is null) return Results.Unauthorized();
+            if (!user.IsAdmin) return Results.Forbid();
+
+            await using var conn = await db.OpenConnectionAsync();
+            var hardwareId = await conn.ExecuteScalarAsync<string?>(
+                "SELECT hardware_id FROM devices WHERE id = @deviceId", new { deviceId });
+            if (hardwareId is null) return Results.NotFound();
+
+            var cred = await emqx.ProvisionAsync(hardwareId);
+            if (cred is null)
+                return Results.Problem(title: "credential provisioning unavailable", statusCode: StatusCodes.Status503ServiceUnavailable);
+
+            await conn.ExecuteAsync(
+                "UPDATE devices SET mqtt_username = @u, mqtt_password = @p WHERE id = @deviceId",
+                new { u = cred.Username, p = cred.Password, deviceId });
+
+            return Results.Ok(new { hardwareid = hardwareId, mqttusername = cred.Username, mqttpassword = cred.Password });
+        });
+
+        // ---- device state / commands ------------------------------------------
+
         app.MapGet("/api/homes/{homeId:guid}/relay-states", async (HttpContext ctx, Guid homeId, NpgsqlDataSource db, CurrentUserService cus) =>
         {
             var user = await cus.ResolveAsync(ctx.User);
@@ -286,21 +345,23 @@ public static class DeviceEndpoints
             if (user is null) return Results.Unauthorized();
 
             await using var conn = await db.OpenConnectionAsync();
-            var homeId = await conn.ExecuteScalarAsync<Guid?>(
+
+            var target = await conn.QuerySingleOrDefaultAsync<(Guid HomeId, Guid DeviceId)>(
                 """
-                SELECT d.home_id FROM device_channels c JOIN devices d ON d.id = c.device_id
+                SELECT d.home_id AS HomeId, c.device_id AS DeviceId
+                FROM device_channels c JOIN devices d ON d.id = c.device_id
                 WHERE c.id = @channelId
                 """, new { channelId });
-            if (homeId is null) return Results.NotFound();
-            if (!await Access.CanAccessHomeAsync(conn, user, homeId.Value)) return Results.Forbid();
+            if (target == default) return Results.NotFound();
 
-            // appliance_type is the only structural field left — admin only (legacy parity).
+            // Appliance type changes require admin; renaming/icons require home membership.
             if (input.ApplianceType is not null && !user.IsAdmin) return Results.Forbid();
+            if (!await Access.CanAccessHomeAsync(conn, user, target.HomeId)) return Results.Forbid();
 
             var channel = await conn.QuerySingleAsync(
                 """
-                UPDATE device_channels SET
-                    name           = COALESCE(@name, name),
+                UPDATE device_channels
+                SET name           = COALESCE(@name, name),
                     icon           = COALESCE(@icon, icon),
                     appliance_type = COALESCE(@applianceType, appliance_type),
                     is_favorite    = COALESCE(@isFavorite, is_favorite),
